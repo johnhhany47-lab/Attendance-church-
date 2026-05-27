@@ -1,0 +1,1276 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>✝ شباب الكنيسة</title>
+<link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Cairo:wght@300;400;600;700;900&display=swap" rel="stylesheet"/>
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+import { getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, query, where, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
+
+// Config loaded securely from Vercel environment
+async function initApp() {
+const configRes = await fetch('/api/config');
+const firebaseConfig = await configRes.json();
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const storage = getStorage(app);
+
+const DEFAULT_TEAMS = [
+  { id: "team_eagle", name: "فريق النسر",   color: "#E74C3C", icon: "🦅", total_points: 0 },
+  { id: "team_lion",  name: "فريق الأسد",   color: "#F39C12", icon: "🦁", total_points: 0 },
+  { id: "team_bull",  name: "فريق الثور",   color: "#27AE60", icon: "🐂", total_points: 0 },
+  { id: "team_human", name: "فريق الإنسان", color: "#2980B9", icon: "👤", total_points: 0 },
+];
+
+// ── Bootstrap Teams ──────────────────────────────────
+async function bootstrapTeams() {
+  for (const team of DEFAULT_TEAMS) {
+    const r = doc(db, "teams", team.id);
+    const s = await getDoc(r);
+    if (!s.exists()) await setDoc(r, team);
+  }
+}
+
+// ── State ────────────────────────────────────────────
+let currentUser = null;
+let currentPage = 'dashboard';
+let activeMeetingCache = null;
+
+// ── Auth Listener ─────────────────────────────────────
+onAuthStateChanged(auth, async (fbUser) => {
+  if (fbUser) {
+    await bootstrapTeams();
+    const snap = await getDoc(doc(db, "users", fbUser.uid));
+    if (snap.exists()) {
+      currentUser = { id: snap.id, ...snap.data() };
+      if (currentUser.team_id) {
+        const tSnap = await getDoc(doc(db, "teams", currentUser.team_id));
+        if (tSnap.exists()) currentUser.teams = { id: tSnap.id, ...tSnap.data() };
+      }
+      showApp();
+      navigateTo('dashboard');
+    }
+  } else {
+    currentUser = null;
+    showAuth();
+  }
+});
+
+// ── Auth Functions ────────────────────────────────────
+async function doRegister(e) {
+  e.preventDefault();
+  const name = document.getElementById('reg-name').value;
+  const email = document.getElementById('reg-email').value;
+  const pass = document.getElementById('reg-pass').value;
+  const phone = document.getElementById('reg-phone').value;
+  const role = document.querySelector('.role-btn.active')?.dataset.role || 'youth';
+  const teamId = document.querySelector('.team-btn.active')?.dataset.team || '';
+  showMsg('reg-msg', '⏳ جاري التسجيل...', 'info');
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    await setDoc(doc(db, "users", cred.user.uid), {
+      uid: cred.user.uid, name, phone, role,
+      team_id: role === 'youth' ? teamId : '',
+      total_points: 0, created_at: serverTimestamp()
+    });
+  } catch(err) {
+    showMsg('reg-msg', '❌ ' + (err.code === 'auth/email-already-in-use' ? 'الإيميل مستخدم بالفعل' : err.message), 'error');
+  }
+}
+
+async function doLogin(e) {
+  e.preventDefault();
+  const email = document.getElementById('login-email').value;
+  const pass = document.getElementById('login-pass').value;
+  showMsg('login-msg', '⏳ جاري الدخول...', 'info');
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(err) {
+    showMsg('login-msg', '❌ بيانات غير صحيحة', 'error');
+  }
+}
+
+async function doLogout() {
+  await signOut(auth);
+}
+
+// ── Navigation ────────────────────────────────────────
+function navigateTo(page) {
+  currentPage = page;
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const navEl = document.querySelector(`.nav-item[data-page="${page}"]`);
+  if (navEl) navEl.classList.add('active');
+  renderPage(page);
+  document.getElementById('sidebar').classList.remove('open');
+}
+
+// ── Pages ─────────────────────────────────────────────
+async function renderPage(page) {
+  const content = document.getElementById('page-content');
+  content.innerHTML = '<div class="loader-wrap"><div class="loader"></div></div>';
+  switch(page) {
+    case 'dashboard': content.innerHTML = await pageDashboard(); break;
+    case 'attendance': content.innerHTML = await pageAttendance(); await initAttendance(); break;
+    case 'homework': content.innerHTML = await pageHomework(); break;
+    case 'competitions': content.innerHTML = await pageCompetitions(); break;
+    case 'teams': content.innerHTML = await pageTeams(); break;
+    case 'servant': content.innerHTML = await pageServant(); break;
+  }
+}
+
+// ── DASHBOARD ─────────────────────────────────────────
+async function pageDashboard() {
+  const [teams, attendance] = await Promise.all([
+    getTeamsSorted(),
+    getUserAttendance(currentUser.id)
+  ]);
+  const isServant = currentUser.role === 'servant';
+  const myTeam = teams.find(t => t.id === currentUser.team_id);
+
+  const teamsHtml = teams.map((t,i) => `
+    <div class="team-card ${currentUser.team_id === t.id ? 'my-team' : ''}" style="--tc:${t.color}">
+      ${i===0 ? '<div class="crown">👑</div>' : ''}
+      <div class="team-rank">#${i+1}</div>
+      <div class="team-emoji">${t.icon}</div>
+      <div class="team-card-name">${t.name}</div>
+      <div class="team-card-pts">${t.total_points} نقطة</div>
+    </div>
+  `).join('');
+
+  const attHtml = attendance.slice(0,5).map(a => `
+    <div class="list-item">
+      <span class="list-icon">✅</span>
+      <div class="list-info"><div class="list-title">${a.meeting_title||'اجتماع'}</div><div class="list-sub">${a.meeting_date||''}</div></div>
+      <div class="att-pts">+${a.points_earned} 🌟</div>
+    </div>
+  `).join('') || '<div class="empty"><span>📋</span><p>لم يتم تسجيل حضور بعد</p></div>';
+
+  return `
+    <div class="welcome-hero">
+      <div class="welcome-left">
+        <span class="hero-cross">✝</span>
+        <div>
+          <h1 class="welcome-title">مرحباً، ${currentUser.name.split(' ')[0]} 👋</h1>
+          <p class="welcome-sub">${isServant ? '⭐ خادم مبارك في خدمتك' : `فريق ${myTeam?.name||'غير محدد'} ${myTeam?.icon||''}`}</p>
+        </div>
+      </div>
+      <div class="welcome-stats">
+        <div class="stat-pill"><span>🌟</span><div><div class="stat-num">${currentUser.total_points||0}</div><div class="stat-lbl">نقاطي</div></div></div>
+        <div class="stat-pill"><span>✅</span><div><div class="stat-num">${attendance.length}</div><div class="stat-lbl">حضور</div></div></div>
+      </div>
+    </div>
+    <div class="section">
+      <h2 class="section-title">⚔️ ترتيب الفرق</h2>
+      <div class="teams-row">${teamsHtml}</div>
+    </div>
+    <div class="section">
+      <h2 class="section-title">📅 آخر اجتماعاتي</h2>
+      <div class="list-container">${attHtml}</div>
+    </div>
+  `;
+}
+
+// ── ATTENDANCE ────────────────────────────────────────
+async function pageAttendance() {
+  const isServant = currentUser.role === 'servant';
+  const meetings = await getMeetings();
+  const active = await getActiveMeeting();
+  activeMeetingCache = active;
+
+  let activeHtml = '';
+  if (active) {
+    if (isServant) {
+      const attendance = await getAttendanceForMeeting(active.id);
+      const allUsers = await getAllUsers();
+      const youthOptions = allUsers.filter(u=>u.role==='youth').map(u=>`<option value="${u.id}">${u.name} - ${u.team_name||'بدون فريق'}</option>`).join('');
+      const attendees = attendance.map(a=>`
+        <div class="attendee-chip" style="--tc:${a.team_color||'#C9A84C'}">
+          <span>${a.team_icon||'👤'}</span><span>${a.user_name}</span>
+        </div>`).join('') || '<p class="text-muted">لا يوجد حاضرون بعد</p>';
+
+      activeHtml = `
+        <div class="card active-meeting-card">
+          <div class="active-badge">🔴 اجتماع نشط</div>
+          <h2 class="meeting-title">${active.title}</h2>
+          <p class="meeting-date">📅 ${active.meeting_date} | 🕐 ${active.meeting_time}</p>
+          <div class="servant-actions">
+            <div class="qr-display">
+              <p class="qr-label">QR Code الاجتماع</p>
+              <div class="qr-wrapper" id="qr-container"></div>
+              <p class="qr-hint">اعرض هذا الكود للشباب</p>
+            </div>
+            <div class="manual-record">
+              <h3 class="section-title">تسجيل يدوي</h3>
+              <div id="manual-msg"></div>
+              <select class="form-select" id="manual-user">
+                <option value="">اختر الشاب...</option>${youthOptions}
+              </select>
+              <button class="btn btn-primary mt" onclick="manualRecord()">✅ تسجيل الحضور</button>
+            </div>
+          </div>
+          <div class="section-title mt">👥 الحاضرون (${attendance.length})</div>
+          <div class="attendees-wrap">${attendees}</div>
+        </div>`;
+    } else {
+      activeHtml = `
+        <div class="card active-meeting-card">
+          <div class="active-badge">🔴 اجتماع نشط</div>
+          <h2 class="meeting-title">${active.title}</h2>
+          <p class="meeting-date">📅 ${active.meeting_date}</p>
+          <div class="youth-scanner">
+            <button class="btn btn-primary scan-btn" onclick="startScan()">📷 امسح QR Code للتسجيل</button>
+            <div id="scan-result"></div>
+            <div id="qr-reader" style="width:100%;max-width:400px;margin:16px auto;display:none"></div>
+          </div>
+        </div>`;
+    }
+  } else {
+    activeHtml = `<div class="card"><div class="empty"><span>📅</span><p>لا يوجد اجتماع نشط الآن</p></div></div>`;
+  }
+
+  const meetingsHtml = meetings.map(m=>`
+    <div class="list-item">
+      <span class="list-icon">${m.is_active?'🟢':'⚪'}</span>
+      <div class="list-info"><div class="list-title">${m.title}</div><div class="list-sub">${m.meeting_date} | ${m.meeting_time}</div></div>
+      ${m.is_active?'<span class="badge badge-success">نشط</span>':''}
+    </div>`).join('') || '<div class="empty"><span>📋</span><p>لا توجد اجتماعات</p></div>';
+
+  return `
+    <div class="page-header">
+      <h1 class="page-title">✅ الحضور</h1>
+      ${currentUser.role==='servant'?'<button class="btn btn-primary" onclick="showCreateMeeting()">+ إنشاء اجتماع</button>':''}
+    </div>
+    ${activeHtml}
+    <div class="card mt">
+      <h3 class="section-title">📅 الاجتماعات السابقة</h3>
+      <div class="list-container">${meetingsHtml}</div>
+    </div>
+    <!-- Create Meeting Modal -->
+    <div id="create-meeting-modal" class="modal-overlay" style="display:none" onclick="closeModal('create-meeting-modal')">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h2 class="modal-title">➕ إنشاء اجتماع</h2>
+          <button class="modal-close" onclick="closeModal('create-meeting-modal')">✕</button>
+        </div>
+        <div id="create-mtg-msg"></div>
+        <div class="form-group"><label class="form-label">العنوان *</label><input class="form-input" id="mtg-title" placeholder="اجتماع الأحد"/></div>
+        <div class="form-row">
+          <div class="form-group"><label class="form-label">التاريخ</label><input type="date" class="form-input" id="mtg-date"/></div>
+          <div class="form-group"><label class="form-label">الوقت</label><input type="time" class="form-input" id="mtg-time"/></div>
+        </div>
+        <button class="btn btn-primary w-full" onclick="createMeetingAction()">✅ إنشاء</button>
+      </div>
+    </div>`;
+}
+
+async function initAttendance() {
+  if (activeMeetingCache && currentUser.role === 'servant') {
+    // Generate QR using canvas
+    const container = document.getElementById('qr-container');
+    if (container) {
+      const qrVal = activeMeetingCache.qr_code;
+      container.innerHTML = `<canvas id="qr-canvas"></canvas>`;
+      await generateQR(qrVal, 'qr-canvas');
+    }
+  }
+}
+
+async function generateQR(text, canvasId) {
+  // Simple QR using Google Charts API as image
+  const img = document.createElement('img');
+  img.src = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(text)}&color=0A1628&bgcolor=F5ECD5`;
+  img.style.borderRadius = '8px';
+  img.width = 180; img.height = 180;
+  const canvas = document.getElementById(canvasId);
+  if (canvas) canvas.replaceWith(img);
+}
+
+window.manualRecord = async function() {
+  const userId = document.getElementById('manual-user').value;
+  if (!userId || !activeMeetingCache) return;
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = '⏳...';
+  try {
+    const result = await recordAttendance(userId, activeMeetingCache.id, currentUser.id);
+    showMsg('manual-msg', result.alreadyRecorded ? '⚠️ سُجّل مسبقاً' : '✅ تم تسجيل الحضور بنجاح!', result.alreadyRecorded ? 'warning' : 'success');
+    if (!result.alreadyRecorded) setTimeout(() => navigateTo('attendance'), 1500);
+  } catch(e) { showMsg('manual-msg', '❌ خطأ', 'error'); }
+  btn.disabled = false; btn.textContent = '✅ تسجيل الحضور';
+};
+
+window.startScan = async function() {
+  const { Html5QrcodeScanner } = await import('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js').catch(()=>({}));
+  document.getElementById('qr-reader').style.display = 'block';
+  document.querySelector('.scan-btn').style.display = 'none';
+  const scanner = new Html5QrcodeScanner('qr-reader', { fps:10, qrbox:250 });
+  scanner.render(async (decoded) => {
+    scanner.clear();
+    document.getElementById('qr-reader').style.display = 'none';
+    try {
+      const snap = await getDocs(query(collection(db,'meetings'), where('qr_code','==',decoded), where('is_active','==',true)));
+      if (snap.empty) throw new Error('كود غير صالح');
+      const meeting = { id: snap.docs[0].id, ...snap.docs[0].data() };
+      const result = await recordAttendance(currentUser.id, meeting.id, null);
+      document.getElementById('scan-result').innerHTML = `<div class="scan-result ${result.alreadyRecorded?'warning':'success'}">${result.alreadyRecorded?'⚠️ سُجّلت مسبقاً':'✅ تم تسجيل حضورك! +10 نقاط 🌟'}</div>`;
+    } catch(e) {
+      document.getElementById('scan-result').innerHTML = `<div class="scan-result error">❌ ${e.message}</div>`;
+    }
+  }, ()=>{});
+};
+
+window.showCreateMeeting = function() { document.getElementById('create-meeting-modal').style.display='flex'; };
+window.createMeetingAction = async function() {
+  const title = document.getElementById('mtg-title').value;
+  const date = document.getElementById('mtg-date').value;
+  const time = document.getElementById('mtg-time').value;
+  if (!title) { showMsg('create-mtg-msg','⚠️ أدخل العنوان','warning'); return; }
+  const qrCode = `mtg_${Date.now()}_${Math.random().toString(36).substr(2,8)}`;
+  // Deactivate old
+  if (activeMeetingCache) await updateDoc(doc(db,'meetings',activeMeetingCache.id), {is_active:false});
+  await addDoc(collection(db,'meetings'), { title, meeting_date:date, meeting_time:time, qr_code:qrCode, is_active:true, created_by:currentUser.id, created_at:serverTimestamp() });
+  closeModal('create-meeting-modal');
+  navigateTo('attendance');
+};
+
+// ── HOMEWORK ──────────────────────────────────────────
+async function pageHomework() {
+  const homeworkList = await getHomeworkList();
+  const isServant = currentUser.role === 'servant';
+
+  const hwCards = homeworkList.map(hw => `
+    <div class="hw-card" onclick="openHomework('${hw.id}','${hw.title.replace(/'/g,"\\'")}')">
+      <div class="hw-icon">📖</div>
+      <div class="hw-body">
+        <div class="hw-title">${hw.title}</div>
+        ${hw.description?`<div class="hw-desc">${hw.description}</div>`:''}
+        ${hw.due_date?`<div class="hw-due">⏰ ${hw.due_date}</div>`:''}
+        ${hw.creator_name?`<div class="hw-by">بقلم: ${hw.creator_name}</div>`:''}
+      </div>
+      ${!isServant?`<button class="btn btn-primary btn-sm" onclick="event.stopPropagation();showSubmitHW('${hw.id}','${hw.title.replace(/'/g,"\\'")}')">📤 تسليم</button>`:''}
+    </div>`).join('') || '<div class="empty"><span>📝</span><p>لا توجد واجبات حالياً</p></div>';
+
+  return `
+    <div class="page-header">
+      <h1 class="page-title">📚 الواجبات</h1>
+      ${isServant?'<button class="btn btn-primary" onclick="showCreateHW()">+ إنشاء واجب</button>':''}
+    </div>
+    <div id="hw-msg"></div>
+    <div class="hw-list">${hwCards}</div>
+
+    <!-- Submissions panel -->
+    <div id="submissions-panel" style="display:none" class="card mt">
+      <div id="submissions-content"></div>
+    </div>
+
+    <!-- Create HW Modal -->
+    <div id="create-hw-modal" class="modal-overlay" style="display:none" onclick="closeModal('create-hw-modal')">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header"><h2 class="modal-title">➕ إنشاء واجب</h2><button class="modal-close" onclick="closeModal('create-hw-modal')">✕</button></div>
+        <div class="form-group"><label class="form-label">العنوان *</label><input class="form-input" id="hw-title-input" placeholder="اسم الواجب"/></div>
+        <div class="form-group"><label class="form-label">الوصف</label><textarea class="form-textarea" id="hw-desc-input" placeholder="تفاصيل الواجب..."></textarea></div>
+        <div class="form-group"><label class="form-label">موعد التسليم</label><input type="date" class="form-input" id="hw-due-input"/></div>
+        <button class="btn btn-primary w-full" onclick="createHWAction()">✅ نشر الواجب</button>
+      </div>
+    </div>
+
+    <!-- Submit HW Modal -->
+    <div id="submit-hw-modal" class="modal-overlay" style="display:none" onclick="closeModal('submit-hw-modal')">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header"><h2 class="modal-title">📤 تسليم الواجب</h2><button class="modal-close" onclick="closeModal('submit-hw-modal')">✕</button></div>
+        <p id="submit-hw-name" class="text-muted mb"></p>
+        <div class="form-group">
+          <label class="form-label">📎 رفع ملف أو صورة</label>
+          <div class="file-upload-area" onclick="document.getElementById('hw-file-input').click()">
+            <div id="file-label"><span>📁</span><p>اضغط لاختيار ملف</p><small>صورة أو PDF أو Word</small></div>
+          </div>
+          <input type="file" id="hw-file-input" style="display:none" accept="image/*,.pdf,.doc,.docx" onchange="onFileSelect(this)"/>
+        </div>
+        <div id="submit-hw-msg"></div>
+        <button class="btn btn-primary w-full" id="submit-hw-btn" onclick="submitHWAction()">📤 تسليم</button>
+      </div>
+    </div>
+
+    <!-- Review Modal -->
+    <div id="review-modal" class="modal-overlay" style="display:none" onclick="closeModal('review-modal')">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header"><h2 class="modal-title">✏️ تصحيح الواجب</h2><button class="modal-close" onclick="closeModal('review-modal')">✕</button></div>
+        <p id="review-student-name" class="text-muted mb"></p>
+        <a id="review-file-link" href="#" target="_blank" class="btn btn-outline btn-sm mb" style="display:none">👁️ عرض الواجب</a>
+        <div class="form-group"><label class="form-label">الدرجة (من 100)</label><input type="number" class="form-input" id="review-grade" min="0" max="100" placeholder="85"/></div>
+        <div class="form-group"><label class="form-label">التعليق</label><textarea class="form-textarea" id="review-feedback" placeholder="اكتب تعليقك..."></textarea></div>
+        <button class="btn btn-primary w-full" onclick="submitReview()">✅ حفظ التصحيح</button>
+      </div>
+    </div>`;
+}
+
+let currentHWId = null, currentSubId = null;
+
+window.showCreateHW = function() { document.getElementById('create-hw-modal').style.display='flex'; };
+window.createHWAction = async function() {
+  const title = document.getElementById('hw-title-input').value;
+  if (!title) return;
+  await addDoc(collection(db,'homework'), { title, description: document.getElementById('hw-desc-input').value, due_date: document.getElementById('hw-due-input').value, created_by: currentUser.id, created_at: serverTimestamp() });
+  closeModal('create-hw-modal');
+  showMsg('hw-msg','✅ تم نشر الواجب','success');
+  setTimeout(()=>navigateTo('homework'),1500);
+};
+
+window.showSubmitHW = function(hwId, hwTitle) {
+  currentHWId = hwId;
+  document.getElementById('submit-hw-name').textContent = hwTitle;
+  document.getElementById('submit-hw-modal').style.display = 'flex';
+};
+
+window.onFileSelect = function(input) {
+  const file = input.files[0];
+  if (file) document.getElementById('file-label').innerHTML = `<span>${file.type.startsWith('image')?'🖼️':'📄'}</span><p>${file.name}</p>`;
+};
+
+window.submitHWAction = async function() {
+  const file = document.getElementById('hw-file-input').files[0];
+  if (!file) { showMsg('submit-hw-msg','⚠️ اختر ملف أولاً','warning'); return; }
+  const btn = document.getElementById('submit-hw-btn');
+  btn.disabled = true; btn.textContent = '⏳ جاري الرفع...';
+  try {
+    const path = `homework/${currentHWId}/${currentUser.id}/${Date.now()}_${file.name}`;
+    const storageRef = ref(storage, path);
+    await uploadBytes(storageRef, file);
+    const fileUrl = await getDownloadURL(storageRef);
+    await setDoc(doc(db,'homework_submissions',`${currentHWId}_${currentUser.id}`), {
+      homework_id: currentHWId, user_id: currentUser.id, file_url: fileUrl, file_type: file.type,
+      status: 'pending', submitted_at: serverTimestamp()
+    });
+    closeModal('submit-hw-modal');
+    showMsg('hw-msg','✅ تم تسليم الواجب بنجاح!','success');
+  } catch(e) { showMsg('submit-hw-msg','❌ خطأ في الرفع','error'); }
+  btn.disabled = false; btn.textContent = '📤 تسليم';
+};
+
+window.openHomework = async function(hwId, hwTitle) {
+  if (currentUser.role !== 'servant') return;
+  const panel = document.getElementById('submissions-panel');
+  panel.style.display = 'block';
+  document.getElementById('submissions-content').innerHTML = '<div class="loader-wrap"><div class="loader"></div></div>';
+  
+  const snap = await getDocs(query(collection(db,'homework_submissions'), where('homework_id','==',hwId)));
+  const subs = snap.docs.map(d=>({id:d.id,...d.data()}));
+  
+  const enriched = await Promise.all(subs.map(async s => {
+    const uSnap = await getDoc(doc(db,'users',s.user_id));
+    if (uSnap.exists()) { const u=uSnap.data(); s.user_name=u.name; }
+    return s;
+  }));
+
+  const STATUS = { pending:'⏳ قيد المراجعة', approved:'✅ مقبول', needs_revision:'🔄 يحتاج مراجعة' };
+  const subHtml = enriched.map(s=>`
+    <div class="submission-item">
+      <div class="sub-header"><div><div class="sub-name">${s.user_name||'مجهول'}</div></div><span class="badge ${s.status==='approved'?'badge-success':s.status==='needs_revision'?'badge-danger':'badge-warning'}">${STATUS[s.status]||s.status}</span></div>
+      ${s.file_url?`<a href="${s.file_url}" target="_blank" class="sub-file">${s.file_type?.startsWith('image')?'🖼️ عرض الصورة':'📄 تحميل الملف'}</a>`:''}
+      ${s.grade?`<div class="sub-grade">الدرجة: <strong>${s.grade}/100</strong>${s.servant_feedback?`<p class="sub-feedback">${s.servant_feedback}</p>`:''}</div>`:''}
+      ${s.status==='pending'?`<button class="btn btn-secondary btn-sm mt" onclick="showReview('${s.id}','${(s.user_name||'').replace(/'/g,"\\'")}','${s.file_url||''}')">✏️ تصحيح</button>`:''}
+    </div>`).join('') || '<div class="empty"><span>📭</span><p>لا توجد تسليمات بعد</p></div>';
+
+  document.getElementById('submissions-content').innerHTML = `<h3 class="section-title">📬 تسليمات: ${hwTitle}</h3>${subHtml}`;
+  panel.scrollIntoView({behavior:'smooth'});
+};
+
+window.showReview = function(subId, studentName, fileUrl) {
+  currentSubId = subId;
+  document.getElementById('review-student-name').textContent = 'الطالب: ' + studentName;
+  const link = document.getElementById('review-file-link');
+  if (fileUrl) { link.href=fileUrl; link.style.display='inline-flex'; } else { link.style.display='none'; }
+  document.getElementById('review-modal').style.display='flex';
+};
+
+window.submitReview = async function() {
+  const grade = parseInt(document.getElementById('review-grade').value);
+  const feedback = document.getElementById('review-feedback').value;
+  if (!grade) return;
+  await updateDoc(doc(db,'homework_submissions',currentSubId), {
+    grade, servant_feedback: feedback,
+    status: grade>=50?'approved':'needs_revision',
+    reviewed_by: currentUser.id, reviewed_at: serverTimestamp()
+  });
+  closeModal('review-modal');
+  showMsg('hw-msg','✅ تم التصحيح بنجاح','success');
+};
+
+// ── COMPETITIONS ──────────────────────────────────────
+let quizState = null;
+
+async function pageCompetitions() {
+  const comps = await getCompetitionsList();
+  const isServant = currentUser.role === 'servant';
+
+  const compCards = comps.map(c=>`
+    <div class="comp-card ${c.is_active?'comp-active':''}">
+      <div class="comp-card-header"><span class="comp-icon">🏆</span><span class="badge ${c.is_active?'badge-success':'badge-blue'}">${c.is_active?'نشطة':'قادمة'}</span></div>
+      <h3 class="comp-title">${c.title}</h3>
+      ${c.description?`<p class="comp-desc">${c.description}</p>`:''}
+      <div class="comp-meta"><span>❓ ${c.questions?.length||0} سؤال</span><span>⏱️ ${c.time_limit_minutes} دقيقة</span><span>🌟 ${c.points_per_question} نقطة/سؤال</span></div>
+      <div class="comp-actions">
+        ${!isServant && c.is_active ? `<button class="btn btn-primary" onclick="startQuiz('${c.id}')">🚀 ابدأ</button>` : ''}
+        ${isServant && !c.is_active ? `<button class="btn btn-secondary" onclick="activateComp('${c.id}')">▶ تفعيل</button>` : ''}
+        <button class="btn btn-outline btn-sm" onclick="showResults('${c.id}','${c.title.replace(/'/g,"\\'")}')">📊 النتائج</button>
+      </div>
+    </div>`).join('') || '<div class="empty" style="grid-column:1/-1"><span>🏆</span><p>لا توجد مسابقات حالياً</p></div>';
+
+  return `
+    <div class="page-header">
+      <h1 class="page-title">🏆 المسابقات</h1>
+      ${isServant?'<button class="btn btn-primary" onclick="showCreateComp()">+ إنشاء مسابقة</button>':''}
+    </div>
+    <div id="comp-msg"></div>
+    <div class="comp-grid">${compCards}</div>
+
+    <!-- Quiz container -->
+    <div id="quiz-container" style="display:none"></div>
+
+    <!-- Results Modal -->
+    <div id="results-modal" class="modal-overlay" style="display:none" onclick="closeModal('results-modal')">
+      <div class="modal" style="max-width:600px" onclick="event.stopPropagation()">
+        <div class="modal-header"><h2 class="modal-title" id="results-modal-title">📊 النتائج</h2><button class="modal-close" onclick="closeModal('results-modal')">✕</button></div>
+        <div id="results-content"></div>
+      </div>
+    </div>
+
+    <!-- Create Competition Modal -->
+    <div id="create-comp-modal" class="modal-overlay" style="display:none" onclick="closeModal('create-comp-modal')">
+      <div class="modal" style="max-width:680px;max-height:90vh;overflow-y:auto" onclick="event.stopPropagation()">
+        <div class="modal-header"><h2 class="modal-title">➕ إنشاء مسابقة</h2><button class="modal-close" onclick="closeModal('create-comp-modal')">✕</button></div>
+        <div class="form-group"><label class="form-label">العنوان *</label><input class="form-input" id="comp-title-input" placeholder="اسم المسابقة"/></div>
+        <div class="form-row">
+          <div class="form-group"><label class="form-label">⏱️ الوقت (دقيقة)</label><input type="number" class="form-input" id="comp-time" value="30" min="1"/></div>
+          <div class="form-group"><label class="form-label">🌟 نقاط/سؤال</label><input type="number" class="form-input" id="comp-pts" value="5" min="1"/></div>
+        </div>
+        <div class="flex-between mb"><label class="form-label" style="margin:0">❓ الأسئلة</label><button type="button" class="btn btn-outline btn-sm" onclick="addQuestion()">+ سؤال</button></div>
+        <div id="questions-container"></div>
+        <button class="btn btn-primary w-full mt" onclick="createCompAction()">✅ إنشاء</button>
+      </div>
+    </div>`;
+}
+
+let questionsData = [];
+
+window.showCreateComp = function() {
+  questionsData = [{ text:'', options:['','','',''], correct:0 }];
+  renderQuestions();
+  document.getElementById('create-comp-modal').style.display='flex';
+};
+
+window.addQuestion = function() {
+  questionsData.push({ text:'', options:['','','',''], correct:0 });
+  renderQuestions();
+};
+
+function renderQuestions() {
+  const container = document.getElementById('questions-container');
+  if (!container) return;
+  container.innerHTML = questionsData.map((q,qi)=>`
+    <div class="question-block">
+      <div class="q-header"><span class="q-num">س${qi+1}</span>${questionsData.length>1?`<button type="button" class="btn btn-danger btn-sm" onclick="removeQuestion(${qi})">حذف</button>`:''}</div>
+      <input class="form-input mb" placeholder="نص السؤال..." value="${q.text}" onchange="questionsData[${qi}].text=this.value"/>
+      <div class="options-grid">
+        ${q.options.map((opt,oi)=>`
+          <div class="option-input-row">
+            <button type="button" class="correct-btn ${q.correct===oi?'correct-active':''}" onclick="setCorrect(${qi},${oi})">${q.correct===oi?'✅':'⬜'}</button>
+            <input class="form-input" placeholder="${['أ','ب','ج','د'][oi]}" value="${opt}" onchange="questionsData[${qi}].options[${oi}]=this.value"/>
+          </div>`).join('')}
+      </div>
+    </div>`).join('');
+}
+
+window.removeQuestion = function(qi) { questionsData.splice(qi,1); renderQuestions(); };
+window.setCorrect = function(qi,oi) { questionsData[qi].correct=oi; renderQuestions(); };
+
+window.createCompAction = async function() {
+  const title = document.getElementById('comp-title-input').value;
+  if (!title || questionsData.some(q=>!q.text)) { alert('أكمل جميع الحقول'); return; }
+  const questions = questionsData.map(q=>({ text:q.text, options:q.options, correct_answer:q.correct }));
+  await addDoc(collection(db,'competitions'), {
+    title, questions,
+    time_limit_minutes: parseInt(document.getElementById('comp-time').value)||30,
+    points_per_question: parseInt(document.getElementById('comp-pts').value)||5,
+    is_active: false, created_by: currentUser.id, created_at: serverTimestamp()
+  });
+  closeModal('create-comp-modal');
+  showMsg('comp-msg','✅ تم إنشاء المسابقة','success');
+  setTimeout(()=>navigateTo('competitions'),1500);
+};
+
+window.activateComp = async function(compId) {
+  await updateDoc(doc(db,'competitions',compId), { is_active:true, start_time:serverTimestamp() });
+  showMsg('comp-msg','✅ تم تفعيل المسابقة','success');
+  setTimeout(()=>navigateTo('competitions'),1200);
+};
+
+window.startQuiz = async function(compId) {
+  const snap = await getDoc(doc(db,'competitions',compId));
+  const comp = { id: snap.id, ...snap.data() };
+  quizState = { comp, answers: new Array(comp.questions.length).fill(null), current:0, startTime: Date.now(), timeLeft: comp.time_limit_minutes*60 };
+  document.getElementById('quiz-container').style.display='block';
+  document.querySelector('.comp-grid').style.display='none';
+  document.querySelector('.page-header').style.display='none';
+  renderQuiz();
+  quizState.timer = setInterval(()=>{ quizState.timeLeft--; if(quizState.timeLeft<=0){clearInterval(quizState.timer);submitQuiz();} else { const el=document.getElementById('quiz-timer'); if(el) { el.textContent='⏱️ '+formatTime(quizState.timeLeft); if(quizState.timeLeft<60) el.classList.add('timer-danger'); }}}, 1000);
+};
+
+function renderQuiz() {
+  const {comp,answers,current,timeLeft} = quizState;
+  const q = comp.questions[current];
+  const progress = (current/comp.questions.length)*100;
+  document.getElementById('quiz-container').innerHTML = `
+    <div class="quiz-wrap">
+      <div class="quiz-header"><div class="quiz-title">${comp.title}</div><div class="quiz-timer" id="quiz-timer">⏱️ ${formatTime(timeLeft)}</div></div>
+      <div class="quiz-progress-bar"><div class="quiz-progress-fill" style="width:${progress}%"></div></div>
+      <div class="quiz-counter">السؤال ${current+1} من ${comp.questions.length}</div>
+      <div class="quiz-question-card">
+        <div class="quiz-q-text">${q.text}</div>
+        <div class="quiz-options">
+          ${q.options.map((opt,i)=>`<button class="quiz-option ${answers[current]===i?'option-selected':''}" onclick="selectAnswer(${i})"><span class="option-letter">${['أ','ب','ج','د'][i]}</span><span>${opt}</span></button>`).join('')}
+        </div>
+      </div>
+      <div class="quiz-footer">
+        ${current>0?`<button class="btn btn-outline" onclick="quizNav(-1)">◀ السابق</button>`:'<div></div>'}
+        ${current<comp.questions.length-1?`<button class="btn btn-primary" onclick="quizNav(1)" ${answers[current]===null?'disabled':''}>التالي ▶</button>`:`<button class="btn btn-primary" onclick="submitQuiz()">✅ إنهاء</button>`}
+      </div>
+    </div>`;
+}
+
+window.selectAnswer = function(i) { quizState.answers[quizState.current]=i; renderQuiz(); };
+window.quizNav = function(dir) { quizState.current+=dir; renderQuiz(); };
+
+window.submitQuiz = async function() {
+  clearInterval(quizState.timer);
+  const {comp,answers,startTime} = quizState;
+  let score=0;
+  answers.forEach((a,i)=>{ if(comp.questions[i] && a===comp.questions[i].correct_answer) score+=comp.points_per_question; });
+  const timeTaken = Math.floor((Date.now()-startTime)/1000);
+  const total = comp.questions.length * comp.points_per_question;
+  const pct = Math.round((score/total)*100);
+  
+  try {
+    await setDoc(doc(db,'competition_answers',`${comp.id}_${currentUser.id}`), {
+      competition_id:comp.id, user_id:currentUser.id, team_id:currentUser.team_id||'',
+      answers, score, time_taken_seconds:timeTaken, submitted_at:serverTimestamp()
+    });
+    if (currentUser.id) { await addUserPoints(currentUser.id, score); if(currentUser.team_id) await addTeamPoints(currentUser.team_id, score); }
+  } catch(e) {}
+  
+  document.getElementById('quiz-container').innerHTML = `
+    <div class="result-card">
+      <div class="result-emoji">${pct>=70?'🏆':pct>=50?'🌟':'📚'}</div>
+      <h2 class="result-title">${pct>=70?'ممتاز!':pct>=50?'جيد جداً!':'حاول مرة أخرى'}</h2>
+      <div class="result-score">${score} / ${total}</div>
+      <div class="result-pct">${pct}%</div>
+      <p style="color:var(--text-light);margin:12px 0">تم احتساب النقاط لفريقك 🎉</p>
+      <button class="btn btn-primary mt" onclick="navigateTo('competitions')">العودة للمسابقات</button>
+    </div>`;
+};
+
+window.showResults = async function(compId, title) {
+  document.getElementById('results-modal-title').textContent = '📊 ' + title;
+  document.getElementById('results-content').innerHTML = '<div class="loader-wrap"><div class="loader"></div></div>';
+  document.getElementById('results-modal').style.display='flex';
+  const snap = await getDocs(query(collection(db,'competition_answers'), where('competition_id','==',compId)));
+  const list = snap.docs.map(d=>({id:d.id,...d.data()}));
+  const enriched = await Promise.all(list.map(async r => {
+    const uSnap = await getDoc(doc(db,'users',r.user_id));
+    if(uSnap.exists()) r.user_name=uSnap.data().name;
+    if(r.team_id) { const tSnap=await getDoc(doc(db,'teams',r.team_id)); if(tSnap.exists()) r.team=tSnap.data(); }
+    return r;
+  }));
+  enriched.sort((a,b)=>b.score-a.score);
+  document.getElementById('results-content').innerHTML = enriched.length===0
+    ? '<div class="empty"><span>📭</span><p>لا توجد نتائج بعد</p></div>'
+    : enriched.map((r,i)=>`<div class="result-row"><span class="rank-num">#${i+1}</span><span>${r.team?.icon||'👤'}</span><div class="rank-info"><div class="rank-name">${r.user_name||'مجهول'}</div><div class="rank-team">${r.team?.name||''}</div></div><div class="rank-score">${r.score} 🌟</div></div>`).join('');
+};
+
+// ── TEAMS ─────────────────────────────────────────────
+async function pageTeams() {
+  const teams = await getTeamsSorted();
+  const users = await getAllUsers();
+  const leader = teams[0];
+  const maxPts = Math.max(...teams.map(t=>t.total_points), 1);
+
+  const teamsHtml = teams.map((t,i)=>`
+    <div class="podium-card" style="--tc:${t.color}" onclick="showTeamMembers('${t.id}')">
+      <div class="podium-rank">${i===0?'🥇':i===1?'🥈':i===2?'🥉':'#'+(i+1)}</div>
+      <div class="podium-icon">${t.icon}</div>
+      <div class="podium-name">${t.name}</div>
+      <div class="podium-points">${t.total_points}</div>
+      <div class="podium-label">نقطة</div>
+      <div class="podium-bar-bg"><div class="podium-bar-fill" style="width:${(t.total_points/maxPts)*100}%"></div></div>
+      <div style="font-size:12px;color:var(--text-light)">${users.filter(u=>u.team_id===t.id&&u.role==='youth').length} عضو</div>
+    </div>`).join('');
+
+  return `
+    <div class="page-header"><h1 class="page-title">⚔️ الفرق</h1></div>
+    ${leader?`<div class="leader-banner" style="--tc:${leader.color}"><div class="leader-crown">👑</div><div><div style="font-size:12px;color:rgba(255,255,255,0.5);letter-spacing:2px">الفريق الأول</div><div class="leader-name">${leader.icon} ${leader.name}</div><div style="color:rgba(255,255,255,0.8);font-weight:700">${leader.total_points} نقطة</div></div></div>`:''}
+    <div class="teams-podium">${teamsHtml}</div>
+    <div id="team-members-section"></div>`;
+}
+
+window.showTeamMembers = async function(teamId) {
+  const teams = await getTeamsSorted();
+  const users = await getAllUsers();
+  const team = teams.find(t=>t.id===teamId);
+  const members = users.filter(u=>u.team_id===teamId&&u.role==='youth').sort((a,b)=>(b.total_points||0)-(a.total_points||0));
+  const section = document.getElementById('team-members-section');
+  section.innerHTML = `
+    <div class="card mt">
+      <h3 class="section-title" style="color:${team?.color}">${team?.icon} أعضاء ${team?.name}</h3>
+      ${members.length===0
+        ? '<div class="empty"><span>👥</span><p>لا يوجد أعضاء بعد</p></div>'
+        : `<div class="members-grid">${members.map((m,mi)=>`<div class="member-card" style="--tc:${team?.color}"><div class="member-rank">#${mi+1}</div><div class="member-avatar" style="background:${team?.color}">${m.name?.[0]}</div><div class="member-name">${m.name}</div><div class="member-points">${m.total_points||0} 🌟</div></div>`).join('')}</div>`}
+    </div>`;
+  section.scrollIntoView({behavior:'smooth'});
+};
+
+// ── SERVANT DASHBOARD ─────────────────────────────────
+async function pageServant() {
+  const [users, meetings, homework, competitions] = await Promise.all([getAllUsers(), getMeetings(), getHomeworkList(), getCompetitionsList()]);
+  const youth = users.filter(u=>u.role==='youth');
+  const stats = [
+    { icon:'👥', label:'شباب مسجلين', value:youth.length, color:'#2980B9' },
+    { icon:'📅', label:'اجتماعات', value:meetings.length, color:'#27AE60' },
+    { icon:'📚', label:'واجبات', value:homework.length, color:'#F39C12' },
+    { icon:'🏆', label:'مسابقات', value:competitions.length, color:'#E74C3C' },
+  ];
+  return `
+    <div class="page-header"><h1 class="page-title">👑 لوحة الخدام</h1><p class="page-sub">مرحباً ${currentUser.name}</p></div>
+    <div class="servant-stats">${stats.map(s=>`<div class="servant-stat-card" style="--sc:${s.color}"><div class="ss-icon">${s.icon}</div><div class="ss-value">${s.value}</div><div class="ss-label">${s.label}</div></div>`).join('')}</div>
+    <div class="card">
+      <h3 class="section-title">👥 كل الشباب</h3>
+      <div class="members-grid">${youth.map(u=>`<div class="member-card" style="--tc:${u.team_color||'#C9A84C'}"><div class="member-avatar" style="background:${u.team_color||'#C9A84C'}">${u.name?.[0]}</div><div class="member-name">${u.name}</div><div class="member-points">${u.team_name||'بدون فريق'}</div></div>`).join('')||'<div class="empty"><span>👥</span><p>لا يوجد شباب مسجلين بعد</p></div>'}</div>
+    </div>`;
+}
+
+// ── DB HELPERS ────────────────────────────────────────
+async function getTeamsSorted() {
+  const snap = await getDocs(collection(db,'teams'));
+  return snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>b.total_points-a.total_points);
+}
+
+async function getMeetings() {
+  const snap = await getDocs(query(collection(db,'meetings'), orderBy('created_at','desc')));
+  return snap.docs.map(d=>({id:d.id,...d.data()}));
+}
+
+async function getActiveMeeting() {
+  const snap = await getDocs(query(collection(db,'meetings'), where('is_active','==',true)));
+  if(snap.empty) return null;
+  return { id:snap.docs[0].id, ...snap.docs[0].data() };
+}
+
+async function getAttendanceForMeeting(meetingId) {
+  const snap = await getDocs(query(collection(db,'attendance'), where('meeting_id','==',meetingId)));
+  const list = snap.docs.map(d=>({id:d.id,...d.data()}));
+  return Promise.all(list.map(async r => {
+    const uSnap = await getDoc(doc(db,'users',r.user_id));
+    if(uSnap.exists()){
+      const u=uSnap.data(); r.user_name=u.name;
+      if(u.team_id){const tSnap=await getDoc(doc(db,'teams',u.team_id));if(tSnap.exists()){r.team_color=tSnap.data().color;r.team_icon=tSnap.data().icon;}}
+    }
+    return r;
+  }));
+}
+
+async function getUserAttendance(userId) {
+  const snap = await getDocs(query(collection(db,'attendance'), where('user_id','==',userId)));
+  const list = snap.docs.map(d=>({id:d.id,...d.data()}));
+  return Promise.all(list.map(async r => {
+    const mSnap = await getDoc(doc(db,'meetings',r.meeting_id));
+    if(mSnap.exists()){r.meeting_title=mSnap.data().title;r.meeting_date=mSnap.data().meeting_date;}
+    return r;
+  }));
+}
+
+async function recordAttendance(userId, meetingId, scannedById) {
+  const attId = `${userId}_${meetingId}`;
+  const existing = await getDoc(doc(db,'attendance',attId));
+  if(existing.exists()) return { alreadyRecorded:true };
+  const uSnap = await getDoc(doc(db,'users',userId));
+  const userData = uSnap.exists() ? uSnap.data() : {};
+  await setDoc(doc(db,'attendance',attId), { user_id:userId, meeting_id:meetingId, scanned_by:scannedById||'', points_earned:10, scanned_at:serverTimestamp() });
+  await addUserPoints(userId, 10);
+  if(userData.team_id) await addTeamPoints(userData.team_id, 10);
+  return { alreadyRecorded:false };
+}
+
+async function addUserPoints(userId, pts) {
+  const r=doc(db,'users',userId); const s=await getDoc(r);
+  if(s.exists()) await updateDoc(r,{total_points:(s.data().total_points||0)+pts});
+}
+
+async function addTeamPoints(teamId, pts) {
+  if(!teamId) return;
+  const r=doc(db,'teams',teamId); const s=await getDoc(r);
+  if(s.exists()) await updateDoc(r,{total_points:(s.data().total_points||0)+pts});
+}
+
+async function getHomeworkList() {
+  const snap = await getDocs(query(collection(db,'homework'), orderBy('created_at','desc')));
+  const list = snap.docs.map(d=>({id:d.id,...d.data()}));
+  return Promise.all(list.map(async hw => {
+    if(hw.created_by){const uSnap=await getDoc(doc(db,'users',hw.created_by));if(uSnap.exists())hw.creator_name=uSnap.data().name;}
+    return hw;
+  }));
+}
+
+async function getCompetitionsList() {
+  const snap = await getDocs(query(collection(db,'competitions'), orderBy('created_at','desc')));
+  return snap.docs.map(d=>({id:d.id,...d.data()}));
+}
+
+async function getAllUsers() {
+  const snap = await getDocs(collection(db,'users'));
+  const users = snap.docs.map(d=>({id:d.id,...d.data()}));
+  return Promise.all(users.map(async u => {
+    if(u.team_id){const tSnap=await getDoc(doc(db,'teams',u.team_id));if(tSnap.exists()){u.team_name=tSnap.data().name;u.team_color=tSnap.data().color;u.team_icon=tSnap.data().icon;}}
+    return u;
+  }));
+}
+
+// ── UI HELPERS ────────────────────────────────────────
+function showMsg(id, msg, type) {
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.innerHTML = `<div class="alert alert-${type==='success'?'success':type==='error'?'error':type==='warning'?'warning':'info'}">${msg}</div>`;
+  if(type==='success') setTimeout(()=>{ if(el) el.innerHTML=''; }, 3000);
+}
+
+window.closeModal = function(id) { document.getElementById(id).style.display='none'; };
+function formatTime(secs) { return `${Math.floor(secs/60).toString().padStart(2,'0')}:${(secs%60).toString().padStart(2,'0')}`; }
+
+// ── UI VIEWS ──────────────────────────────────────────
+function showAuth() {
+  document.getElementById('app').style.display='none';
+  document.getElementById('auth-section').style.display='flex';
+  showAuthTab('login');
+}
+
+function showApp() {
+  document.getElementById('auth-section').style.display='none';
+  document.getElementById('app').style.display='flex';
+  // Update sidebar user info
+  document.getElementById('sidebar-name').textContent = currentUser.name;
+  document.getElementById('sidebar-role').textContent = currentUser.role==='servant' ? '⭐ خادم' : `فريق ${currentUser.teams?.name||'غير محدد'} ${currentUser.teams?.icon||''}`;
+  document.getElementById('sidebar-points').textContent = `${currentUser.total_points||0} 🌟`;
+  document.getElementById('sidebar-avatar').textContent = currentUser.teams?.icon || currentUser.name?.[0] || '?';
+  document.getElementById('sidebar-avatar').style.background = currentUser.teams?.color || '#C9A84C';
+  // Show/hide servant nav
+  document.getElementById('servant-nav').style.display = currentUser.role==='servant' ? 'flex' : 'none';
+}
+
+window.showAuthTab = function(tab) {
+  document.getElementById('login-form').style.display = tab==='login'?'block':'none';
+  document.getElementById('register-form').style.display = tab==='register'?'block':'none';
+  document.querySelectorAll('.auth-tab').forEach(t => t.classList.toggle('active', t.dataset.tab===tab));
+};
+
+window.toggleSidebar = function() { document.getElementById('sidebar').classList.toggle('open'); };
+
+// Expose to global
+window.navigateTo = navigateTo;
+window.doLogin = doLogin;
+window.doRegister = doRegister;
+
+} // end initApp
+initApp();
+window.doLogout = doLogout;
+
+// Role/team selection in register
+document.addEventListener('click', e => {
+  if(e.target.closest('.role-btn')) {
+    document.querySelectorAll('.role-btn').forEach(b=>b.classList.remove('active'));
+    e.target.closest('.role-btn').classList.add('active');
+    const role = e.target.closest('.role-btn').dataset.role;
+    document.getElementById('team-section').style.display = role==='youth'?'block':'none';
+  }
+  if(e.target.closest('.team-btn')) {
+    document.querySelectorAll('.team-btn').forEach(b=>b.classList.remove('active'));
+    e.target.closest('.team-btn').classList.add('active');
+  }
+});
+</script>
+
+<style>
+:root {
+  --gold:#C9A84C; --gold-light:#E8C97A; --gold-dark:#8B6914;
+  --deep-blue:#0A1628; --navy:#0D2147; --blue:#1A3A6B; --blue-light:#2350A0;
+  --cream:#F5ECD5; --cream-dark:#E8D5A8; --white:#FFFFFF;
+  --text-dark:#0A1628; --text-mid:#3D5A8A; --text-light:#8FA5C9;
+  --success:#27AE60; --warning:#F39C12; --danger:#E74C3C;
+  --border:rgba(201,168,76,0.3); --shadow:0 4px 24px rgba(10,22,40,0.12);
+  --radius:16px; --tr:all 0.3s cubic-bezier(0.4,0,0.2,1);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Cairo',sans-serif;background:var(--cream);color:var(--text-dark);direction:rtl;min-height:100vh;overflow-x:hidden}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:var(--cream-dark)}::-webkit-scrollbar-thumb{background:var(--gold-dark);border-radius:3px}
+
+/* AUTH */
+#auth-section{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--deep-blue),var(--navy));padding:20px;position:relative;overflow:hidden}
+#auth-section::before{content:'✝';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:400px;color:rgba(201,168,76,0.03);pointer-events:none}
+.auth-card{background:white;border-radius:24px;padding:36px;width:100%;max-width:460px;box-shadow:0 32px 80px rgba(0,0,0,0.4);animation:slideUp .4s ease}
+.auth-logo{text-align:center;margin-bottom:28px}
+.auth-cross{display:block;font-size:48px;color:var(--gold);margin-bottom:8px}
+.auth-title{font-family:'Amiri',serif;font-size:26px;color:var(--deep-blue)}
+.auth-tabs{display:grid;grid-template-columns:1fr 1fr;gap:0;background:var(--cream);border-radius:10px;padding:4px;margin-bottom:24px}
+.auth-tab{padding:10px;border:none;background:none;cursor:pointer;font-family:'Cairo',sans-serif;font-size:14px;font-weight:700;border-radius:8px;color:var(--text-mid);transition:var(--tr)}
+.auth-tab.active{background:white;color:var(--gold-dark);box-shadow:var(--shadow)}
+.role-selector{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:4px}
+.role-btn{padding:12px;border:2px solid var(--border);border-radius:10px;background:var(--cream);cursor:pointer;font-family:'Cairo',sans-serif;font-size:14px;font-weight:600;color:var(--text-mid);transition:var(--tr)}
+.role-btn.active{border-color:var(--gold);background:rgba(201,168,76,0.1);color:var(--gold-dark)}
+.team-selector{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.team-btn{padding:12px 10px;border:2px solid var(--border);border-radius:10px;background:var(--cream);cursor:pointer;font-family:'Cairo',sans-serif;font-weight:600;color:var(--text-mid);display:flex;flex-direction:column;align-items:center;gap:4px;transition:var(--tr)}
+.team-btn.active{border-color:var(--tc,var(--gold));background:rgba(201,168,76,0.1);color:var(--gold-dark)}
+.team-btn .team-icon{font-size:24px}.team-btn .team-name{font-size:12px}
+.auth-footer{text-align:center;margin-top:20px;color:var(--text-mid);font-size:14px}
+.auth-link{color:var(--gold-dark);font-weight:700;cursor:pointer;text-decoration:underline}
+
+/* APP LAYOUT */
+#app{display:flex;min-height:100vh}
+.sidebar{width:250px;min-height:100vh;background:linear-gradient(180deg,var(--deep-blue),var(--navy));display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto;border-left:1px solid rgba(201,168,76,0.2);flex-shrink:0;z-index:100;transition:transform .3s ease}
+.sidebar-header{padding:20px 16px;border-bottom:1px solid rgba(201,168,76,0.2)}
+.sidebar-logo{display:flex;align-items:center;gap:12px}
+.logo-cross{font-size:30px;color:var(--gold)}
+.logo-title{font-family:'Amiri',serif;font-size:18px;font-weight:700;color:var(--gold)}
+.logo-sub{font-size:11px;color:var(--text-light)}
+.sidebar-user{padding:16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(201,168,76,0.15)}
+.user-avatar{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;border:2px solid rgba(201,168,76,0.4);flex-shrink:0}
+.user-name{color:white;font-weight:700;font-size:14px}
+.user-role{color:var(--gold-light);font-size:11px}
+.sidebar-points{margin:12px 16px;background:rgba(201,168,76,0.1);border:1px solid rgba(201,168,76,0.3);border-radius:10px;padding:10px 14px;display:flex;align-items:center;gap:8px;color:var(--gold);font-weight:900;font-size:16px}
+.sidebar-nav{flex:1;padding:8px;display:flex;flex-direction:column;gap:3px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:10px;cursor:pointer;color:var(--text-light);font-weight:600;font-size:14px;transition:var(--tr);border:none;background:none;font-family:'Cairo',sans-serif;width:100%;text-align:right}
+.nav-item:hover{background:rgba(201,168,76,0.1);color:var(--gold-light);transform:translateX(-3px)}
+.nav-item.active{background:rgba(201,168,76,0.2);color:var(--gold);border:1px solid rgba(201,168,76,0.3)}
+.nav-icon{font-size:18px}
+.logout-btn{margin:12px 8px;display:flex;align-items:center;gap:8px;padding:11px 14px;background:rgba(231,76,60,0.1);border:1px solid rgba(231,76,60,0.3);border-radius:10px;color:#FC6C5C;font-family:'Cairo',sans-serif;font-size:14px;font-weight:600;cursor:pointer;width:calc(100% - 16px);transition:var(--tr)}
+.logout-btn:hover{background:rgba(231,76,60,0.2)}
+.main-content{flex:1;min-height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.mobile-header{display:none;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--deep-blue);border-bottom:1px solid rgba(201,168,76,0.2);position:sticky;top:0;z-index:50}
+.hamburger{background:none;border:none;color:var(--gold);font-size:22px;cursor:pointer}
+.mobile-title{font-family:'Amiri',serif;color:var(--gold);font-size:18px;font-weight:700}
+.content-wrapper{flex:1;padding:24px;max-width:1100px;width:100%;margin:0 auto}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99}
+
+/* COMMON */
+.card{background:white;border-radius:var(--radius);padding:22px;box-shadow:var(--shadow);border:1px solid var(--border)}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:11px 22px;border-radius:10px;font-family:'Cairo',sans-serif;font-weight:600;font-size:14px;cursor:pointer;border:none;transition:var(--tr);text-decoration:none;white-space:nowrap}
+.btn-primary{background:linear-gradient(135deg,var(--gold),var(--gold-dark));color:var(--deep-blue)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(201,168,76,0.4)}
+.btn-secondary{background:var(--navy);color:var(--gold);border:1px solid var(--border)}
+.btn-secondary:hover{background:var(--blue)}
+.btn-danger{background:var(--danger);color:white}
+.btn-outline{background:transparent;border:2px solid var(--gold);color:var(--gold-dark)}
+.btn-outline:hover{background:var(--gold);color:var(--deep-blue)}
+.btn-sm{padding:7px 14px;font-size:12px}
+.btn:disabled{opacity:0.5;cursor:not-allowed;transform:none!important}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-weight:600;margin-bottom:6px;color:var(--text-dark);font-size:13px}
+.form-input,.form-select,.form-textarea{width:100%;padding:11px 14px;border:2px solid var(--border);border-radius:10px;font-family:'Cairo',sans-serif;font-size:14px;color:var(--text-dark);background:var(--cream);transition:var(--tr);direction:rtl}
+.form-input:focus,.form-select:focus,.form-textarea:focus{outline:none;border-color:var(--gold);background:white;box-shadow:0 0 0 3px rgba(201,168,76,0.15)}
+.form-textarea{resize:vertical;min-height:90px}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700}
+.badge-gold{background:rgba(201,168,76,0.15);color:var(--gold-dark);border:1px solid var(--gold)}
+.badge-blue{background:rgba(26,58,107,0.1);color:var(--blue-light);border:1px solid rgba(26,58,107,0.3)}
+.badge-success{background:rgba(39,174,96,0.1);color:#1E8449;border:1px solid rgba(39,174,96,0.3)}
+.badge-danger{background:rgba(231,76,60,0.1);color:var(--danger);border:1px solid rgba(231,76,60,0.3)}
+.badge-warning{background:rgba(243,156,18,0.1);color:var(--warning);border:1px solid rgba(243,156,18,0.3)}
+.alert{padding:12px 16px;border-radius:10px;font-size:13px;font-weight:500;margin-bottom:12px}
+.alert-success{background:rgba(39,174,96,0.1);color:#1E8449;border:1px solid rgba(39,174,96,0.4)}
+.alert-error{background:rgba(231,76,60,0.1);color:#C0392B;border:1px solid rgba(231,76,60,0.4)}
+.alert-warning{background:rgba(243,156,18,0.1);color:#B7770D;border:1px solid rgba(243,156,18,0.4)}
+.alert-info{background:rgba(26,58,107,0.1);color:var(--blue);border:1px solid var(--border)}
+.modal-overlay{position:fixed;inset:0;background:rgba(10,22,40,0.7);display:flex;align-items:center;justify-content:center;z-index:1000;padding:16px;backdrop-filter:blur(4px);animation:fadeIn .2s ease}
+.modal{background:white;border-radius:var(--radius);padding:28px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 60px rgba(0,0,0,0.3);animation:slideUp .3s ease}
+.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding-bottom:14px;border-bottom:2px solid var(--border)}
+.modal-title{font-family:'Amiri',serif;font-size:20px;font-weight:700;color:var(--deep-blue)}
+.modal-close{background:none;border:none;font-size:18px;cursor:pointer;color:var(--text-light);transition:var(--tr)}
+.modal-close:hover{color:var(--danger)}
+.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+.page-title{font-family:'Amiri',serif;font-size:26px;font-weight:700;color:var(--deep-blue)}
+.page-sub{color:var(--text-mid);font-size:14px}
+.section{margin-bottom:24px}
+.section-title{font-family:'Amiri',serif;font-size:18px;color:var(--deep-blue);margin-bottom:14px;font-weight:700}
+.empty{text-align:center;padding:36px;color:var(--text-light);background:white;border-radius:var(--radius);border:2px dashed var(--border)}
+.empty span{font-size:44px;display:block;margin-bottom:10px}
+.loader-wrap{display:flex;justify-content:center;padding:48px}
+.loader{width:40px;height:40px;border:3px solid rgba(201,168,76,0.3);border-top-color:var(--gold);border-radius:50%;animation:spin .8s linear infinite}
+.list-container{display:flex;flex-direction:column;gap:8px}
+.list-item{display:flex;align-items:center;gap:12px;padding:13px;background:var(--cream);border-radius:12px;border:1px solid var(--border);transition:var(--tr)}
+.list-item:hover{box-shadow:var(--shadow)}
+.list-icon{font-size:22px;flex-shrink:0}
+.list-info{flex:1}
+.list-title{font-weight:600;color:var(--text-dark);font-size:14px}
+.list-sub{font-size:12px;color:var(--text-light);margin-top:2px}
+.att-pts{font-weight:700;color:var(--gold-dark);font-size:14px}
+.text-muted{color:var(--text-light);font-size:13px}
+.mt{margin-top:16px}
+.mb{margin-bottom:12px}
+.w-full{width:100%}
+
+/* DASHBOARD */
+.welcome-hero{background:linear-gradient(135deg,var(--deep-blue),var(--blue));border-radius:20px;padding:26px;display:flex;align-items:center;justify-content:space-between;gap:14px;border:1px solid rgba(201,168,76,0.3);margin-bottom:24px;position:relative;overflow:hidden}
+.welcome-hero::before{content:'✝';position:absolute;right:-20px;top:-20px;font-size:130px;color:rgba(255,255,255,0.04);line-height:1;pointer-events:none}
+.welcome-left{display:flex;align-items:center;gap:14px}
+.hero-cross{font-size:36px;color:var(--gold)}
+.welcome-title{font-family:'Amiri',serif;font-size:22px;color:white;margin-bottom:4px}
+.welcome-sub{color:var(--gold-light);font-size:13px}
+.welcome-stats{display:flex;gap:10px;flex-shrink:0}
+.stat-pill{background:rgba(255,255,255,0.08);border:1px solid rgba(201,168,76,0.3);border-radius:12px;padding:12px 16px;display:flex;align-items:center;gap:8px;backdrop-filter:blur(10px)}
+.stat-pill>span{font-size:22px}
+.stat-num{font-size:20px;font-weight:900;color:var(--gold);line-height:1}
+.stat-lbl{font-size:10px;color:rgba(255,255,255,0.5)}
+.teams-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.team-card{background:white;border-radius:14px;padding:18px 14px;text-align:center;border:2px solid var(--border);transition:var(--tr);position:relative;box-shadow:var(--shadow);cursor:pointer}
+.team-card:hover{transform:translateY(-4px);border-color:var(--tc,var(--gold))}
+.my-team{border-color:var(--tc,var(--gold))!important}
+.team-rank{font-size:11px;font-weight:700;color:var(--text-light);margin-bottom:6px}
+.team-emoji{font-size:32px;margin-bottom:6px}
+.team-card-name{font-weight:700;color:var(--text-dark);font-size:13px;margin-bottom:5px}
+.team-card-pts{font-size:15px;font-weight:900;color:var(--tc,var(--gold-dark))}
+.crown{position:absolute;top:-10px;left:50%;transform:translateX(-50%);font-size:22px}
+
+/* ATTENDANCE */
+.active-meeting-card{background:linear-gradient(135deg,#fff9ed,#fff);border:2px solid var(--gold);margin-bottom:16px}
+.active-badge{display:inline-block;background:rgba(231,76,60,0.1);color:var(--danger);border:1px solid rgba(231,76,60,0.3);border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;margin-bottom:10px;animation:blink 1.5s ease infinite}
+.meeting-title{font-family:'Amiri',serif;font-size:22px;color:var(--deep-blue);margin-bottom:5px}
+.meeting-date{color:var(--text-mid);font-size:13px;margin-bottom:20px}
+.servant-actions{display:grid;grid-template-columns:auto 1fr;gap:24px;align-items:start}
+.qr-display{text-align:center}
+.qr-label{font-weight:700;font-size:13px;color:var(--text-mid);margin-bottom:10px}
+.qr-wrapper{background:var(--cream);border:3px solid var(--gold);border-radius:14px;padding:16px;display:inline-block;box-shadow:0 4px 20px rgba(201,168,76,0.25)}
+.qr-hint{font-size:11px;color:var(--text-light);margin-top:8px}
+.scan-btn{font-size:15px;padding:14px 28px}
+.scan-result{padding:20px;border-radius:14px;text-align:center;font-size:16px;font-weight:700;margin-top:14px}
+.scan-result.success{background:rgba(39,174,96,0.1);border:2px solid rgba(39,174,96,0.4);color:#1E8449}
+.scan-result.warning{background:rgba(243,156,18,0.1);border:2px solid rgba(243,156,18,0.4);color:#B7770D}
+.scan-result.error{background:rgba(231,76,60,0.1);border:2px solid rgba(231,76,60,0.4);color:#C0392B}
+.attendees-wrap{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.attendee-chip{display:flex;align-items:center;gap:5px;background:color-mix(in srgb,var(--tc,var(--gold)) 10%,white);border:1px solid color-mix(in srgb,var(--tc,var(--gold)) 40%,white);border-radius:20px;padding:5px 12px;font-size:12px;font-weight:600}
+
+/* HOMEWORK */
+.hw-list{display:flex;flex-direction:column;gap:12px}
+.hw-card{background:white;border-radius:14px;padding:16px;border:2px solid var(--border);cursor:pointer;transition:var(--tr);display:flex;align-items:flex-start;gap:12px;box-shadow:var(--shadow)}
+.hw-card:hover{border-color:var(--gold);box-shadow:0 4px 20px rgba(201,168,76,0.25);transform:translateX(-3px)}
+.hw-icon{font-size:28px;flex-shrink:0}
+.hw-body{flex:1}
+.hw-title{font-weight:700;color:var(--text-dark);font-size:15px;margin-bottom:3px}
+.hw-desc{font-size:12px;color:var(--text-mid);margin-bottom:3px}
+.hw-due{font-size:11px;color:var(--danger);font-weight:600}
+.hw-by{font-size:11px;color:var(--text-light);margin-top:3px}
+.submission-item{background:var(--cream);border-radius:12px;padding:14px;border:1px solid var(--border);margin-bottom:10px}
+.sub-header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:8px}
+.sub-name{font-weight:700;color:var(--text-dark);font-size:14px}
+.sub-file{display:inline-block;color:var(--blue-light);font-size:13px;font-weight:600;text-decoration:none;margin-bottom:6px}
+.sub-file:hover{text-decoration:underline}
+.sub-grade{font-size:13px;color:var(--text-dark);margin-top:6px}
+.sub-feedback{font-size:12px;color:var(--text-mid);margin-top:3px;font-style:italic}
+.file-upload-area{border:2px dashed var(--border);border-radius:12px;padding:28px;text-align:center;cursor:pointer;transition:var(--tr);background:var(--cream)}
+.file-upload-area:hover{border-color:var(--gold);background:rgba(201,168,76,0.05)}
+.file-upload-area span{font-size:36px;display:block;margin-bottom:6px}
+.file-upload-area p{color:var(--text-mid);font-size:14px;font-weight:600}
+.file-upload-area small{color:var(--text-light);font-size:11px}
+
+/* COMPETITIONS */
+.comp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.comp-card{background:white;border-radius:16px;padding:20px;border:2px solid var(--border);box-shadow:var(--shadow);transition:var(--tr)}
+.comp-card:hover{transform:translateY(-4px);box-shadow:0 8px 30px rgba(201,168,76,0.2)}
+.comp-active{border-color:var(--gold);background:linear-gradient(135deg,#fffdf5,white)}
+.comp-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.comp-icon{font-size:30px}
+.comp-title{font-family:'Amiri',serif;font-size:18px;font-weight:700;color:var(--deep-blue);margin-bottom:6px}
+.comp-desc{color:var(--text-mid);font-size:13px;margin-bottom:12px}
+.comp-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.comp-meta span{font-size:11px;color:var(--text-light);background:var(--cream);padding:3px 8px;border-radius:16px;border:1px solid var(--border)}
+.comp-actions{display:flex;gap:8px;flex-wrap:wrap}
+.quiz-wrap{max-width:640px;margin:0 auto}
+.quiz-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;background:var(--deep-blue);padding:16px 20px;border-radius:14px}
+.quiz-title{color:var(--gold);font-family:'Amiri',serif;font-size:18px;font-weight:700}
+.quiz-timer{color:white;font-size:20px;font-weight:900;background:rgba(255,255,255,0.1);padding:6px 14px;border-radius:8px}
+.timer-danger{color:var(--danger)!important;animation:blink .5s ease infinite}
+.quiz-progress-bar{height:5px;background:rgba(0,0,0,0.08);border-radius:3px;margin-bottom:10px}
+.quiz-progress-fill{height:100%;background:var(--gold);border-radius:3px;transition:width .3s ease}
+.quiz-counter{color:var(--text-light);font-size:13px;margin-bottom:20px;text-align:center}
+.quiz-question-card{background:white;border-radius:18px;padding:28px;box-shadow:var(--shadow);border:1px solid var(--border)}
+.quiz-q-text{font-size:18px;font-weight:700;color:var(--deep-blue);margin-bottom:22px;text-align:center;line-height:1.5}
+.quiz-options{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.quiz-option{display:flex;align-items:center;gap:10px;padding:14px;border:2px solid var(--border);border-radius:12px;background:var(--cream);cursor:pointer;font-family:'Cairo',sans-serif;font-size:14px;font-weight:600;color:var(--text-dark);transition:var(--tr);text-align:right}
+.quiz-option:hover{border-color:var(--gold);background:rgba(201,168,76,0.05)}
+.option-selected{border-color:var(--gold)!important;background:rgba(201,168,76,0.12)!important;color:var(--gold-dark)!important}
+.option-letter{width:30px;height:30px;border-radius:50%;background:var(--deep-blue);color:var(--gold);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:13px;flex-shrink:0}
+.option-selected .option-letter{background:var(--gold);color:var(--deep-blue)}
+.quiz-footer{display:flex;justify-content:space-between;align-items:center;margin-top:20px}
+.result-card{background:white;border-radius:24px;padding:44px;text-align:center;max-width:380px;width:100%;margin:0 auto;box-shadow:var(--shadow);border:2px solid var(--gold)}
+.result-emoji{font-size:64px;margin-bottom:14px}
+.result-title{font-family:'Amiri',serif;font-size:26px;color:var(--deep-blue);margin-bottom:14px}
+.result-score{font-size:44px;font-weight:900;color:var(--gold-dark)}
+.result-pct{font-size:18px;color:var(--text-mid);margin-bottom:10px}
+.result-row{display:flex;align-items:center;gap:12px;padding:12px;background:var(--cream);border-radius:12px;border:1px solid var(--border);margin-bottom:8px}
+.rank-num{font-size:15px;font-weight:900;color:var(--gold-dark);width:28px;text-align:center}
+.rank-info{flex:1}
+.rank-name{font-weight:700;color:var(--text-dark);font-size:14px}
+.rank-team{font-size:11px;color:var(--text-light)}
+.rank-score{font-size:15px;font-weight:900;color:var(--gold-dark)}
+.question-block{background:var(--cream);border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid var(--border)}
+.q-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.q-num{font-weight:700;color:var(--gold-dark)}
+.options-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.option-input-row{display:flex;align-items:center;gap:7px}
+.correct-btn{background:none;border:none;font-size:16px;cursor:pointer;flex-shrink:0;padding:3px;transition:var(--tr)}
+.correct-btn:hover{transform:scale(1.2)}
+
+/* TEAMS */
+.leader-banner{background:linear-gradient(135deg,var(--deep-blue),var(--navy));border:2px solid var(--tc,var(--gold));border-radius:18px;padding:24px 28px;display:flex;align-items:center;gap:16px;margin-bottom:20px;position:relative;overflow:hidden}
+.leader-crown{font-size:44px;flex-shrink:0}
+.leader-name{font-family:'Amiri',serif;font-size:24px;font-weight:700;color:var(--tc,var(--gold))}
+.teams-podium{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}
+.podium-card{background:white;border-radius:16px;padding:18px 14px;text-align:center;border:2px solid var(--border);cursor:pointer;transition:var(--tr);box-shadow:var(--shadow)}
+.podium-card:hover{border-color:var(--tc,var(--gold));transform:translateY(-5px);box-shadow:0 12px 30px rgba(0,0,0,0.1)}
+.podium-rank{font-size:20px;margin-bottom:8px}
+.podium-icon{font-size:40px;margin-bottom:8px}
+.podium-name{font-weight:700;color:var(--text-dark);font-size:14px;margin-bottom:8px}
+.podium-points{font-size:28px;font-weight:900;color:var(--tc,var(--gold-dark));line-height:1}
+.podium-label{font-size:11px;color:var(--text-light);margin-bottom:10px}
+.podium-bar-bg{height:5px;background:rgba(0,0,0,0.06);border-radius:3px;margin-bottom:8px}
+.podium-bar-fill{height:100%;background:var(--tc,var(--gold));border-radius:3px;transition:width 1s ease}
+.members-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
+.member-card{background:white;border-radius:14px;padding:18px 14px;text-align:center;border:1px solid var(--border);box-shadow:var(--shadow);transition:var(--tr);position:relative}
+.member-card:hover{transform:translateY(-3px);border-color:var(--tc,var(--gold))}
+.member-rank{position:absolute;top:8px;right:10px;font-size:10px;font-weight:700;color:var(--text-light)}
+.member-avatar{width:48px;height:48px;border-radius:50%;margin:0 auto 8px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:white;border:3px solid rgba(255,255,255,0.3)}
+.member-name{font-weight:700;color:var(--text-dark);font-size:13px;margin-bottom:5px}
+.member-points{font-size:13px;font-weight:900;color:var(--tc,var(--gold-dark))}
+
+/* SERVANT */
+.servant-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}
+.servant-stat-card{background:white;border-radius:14px;padding:20px;text-align:center;border:2px solid var(--border);box-shadow:var(--shadow);border-top:4px solid var(--sc,var(--gold));transition:var(--tr)}
+.servant-stat-card:hover{transform:translateY(-4px)}
+.ss-icon{font-size:32px;margin-bottom:8px}
+.ss-value{font-size:32px;font-weight:900;color:var(--sc,var(--gold-dark));line-height:1;margin-bottom:5px}
+.ss-label{font-size:12px;color:var(--text-mid);font-weight:600}
+
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes slideUp{from{transform:translateY(25px);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0.5}}
+
+@media(max-width:768px){
+  .sidebar{position:fixed;top:0;right:0;transform:translateX(100%);height:100%;z-index:100}
+  .sidebar.open{transform:translateX(0)}
+  .sidebar-overlay{display:block}
+  .mobile-header{display:flex}
+  .content-wrapper{padding:14px}
+  .teams-row,.teams-podium{grid-template-columns:repeat(2,1fr)}
+  .servant-actions{grid-template-columns:1fr}
+  .quiz-options,.options-grid{grid-template-columns:1fr}
+  .servant-stats{grid-template-columns:repeat(2,1fr)}
+  .welcome-hero{flex-direction:column;align-items:flex-start}
+  .welcome-stats{width:100%}
+  .stat-pill{flex:1;justify-content:center}
+  .form-row{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- AUTH SECTION -->
+<div id="auth-section" style="display:none">
+  <div class="auth-card">
+    <div class="auth-logo">
+      <span class="auth-cross">✝</span>
+      <h1 class="auth-title">شباب الكنيسة</h1>
+    </div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" data-tab="login" onclick="showAuthTab('login')">تسجيل الدخول</button>
+      <button class="auth-tab" data-tab="register" onclick="showAuthTab('register')">حساب جديد</button>
+    </div>
+
+    <!-- Login -->
+    <div id="login-form">
+      <div id="login-msg"></div>
+      <div class="form-group"><label class="form-label">📧 البريد الإلكتروني</label><input type="email" class="form-input" id="login-email" placeholder="example@church.com"/></div>
+      <div class="form-group"><label class="form-label">🔒 كلمة المرور</label><input type="password" class="form-input" id="login-pass" placeholder="••••••••"/></div>
+      <button class="btn btn-primary w-full" onclick="doLogin(event)">🚪 دخول</button>
+      <div class="auth-footer">ليس لديك حساب؟ <span class="auth-link" onclick="showAuthTab('register')">سجّل الآن</span></div>
+    </div>
+
+    <!-- Register -->
+    <div id="register-form" style="display:none">
+      <div id="reg-msg"></div>
+      <div class="form-group"><label class="form-label">👤 الاسم الكامل *</label><input class="form-input" id="reg-name" placeholder="اسمك الكامل"/></div>
+      <div class="form-group"><label class="form-label">📧 البريد الإلكتروني *</label><input type="email" class="form-input" id="reg-email" placeholder="example@church.com"/></div>
+      <div class="form-group"><label class="form-label">📱 رقم الهاتف</label><input class="form-input" id="reg-phone" placeholder="01xxxxxxxxx"/></div>
+      <div class="form-group"><label class="form-label">🔒 كلمة المرور *</label><input type="password" class="form-input" id="reg-pass" placeholder="6 أحرف على الأقل"/></div>
+      <div class="form-group">
+        <label class="form-label">🎭 أنا...</label>
+        <div class="role-selector">
+          <button class="role-btn active" data-role="youth">🙋‍♂️ شاب / فتاة</button>
+          <button class="role-btn" data-role="servant">⭐ خادم / خادمة</button>
+        </div>
+      </div>
+      <div id="team-section" class="form-group">
+        <label class="form-label">⚔️ اختر فريقك</label>
+        <div class="team-selector">
+          <button class="team-btn" data-team="team_eagle" style="--tc:#E74C3C"><span class="team-icon">🦅</span><span class="team-name">فريق النسر</span></button>
+          <button class="team-btn" data-team="team_lion" style="--tc:#F39C12"><span class="team-icon">🦁</span><span class="team-name">فريق الأسد</span></button>
+          <button class="team-btn" data-team="team_bull" style="--tc:#27AE60"><span class="team-icon">🐂</span><span class="team-name">فريق الثور</span></button>
+          <button class="team-btn" data-team="team_human" style="--tc:#2980B9"><span class="team-icon">👤</span><span class="team-name">فريق الإنسان</span></button>
+        </div>
+      </div>
+      <button class="btn btn-primary w-full" onclick="doRegister(event)">✅ إنشاء الحساب</button>
+      <div class="auth-footer">لديك حساب؟ <span class="auth-link" onclick="showAuthTab('login')">سجّل دخولك</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app" style="display:none">
+  <div class="sidebar-overlay" onclick="toggleSidebar()"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">
+        <span class="logo-cross">✝</span>
+        <div><div class="logo-title">شباب الكنيسة</div><div class="logo-sub">مرحباً بكم</div></div>
+      </div>
+    </div>
+    <div class="sidebar-user">
+      <div class="user-avatar" id="sidebar-avatar">?</div>
+      <div><div class="user-name" id="sidebar-name">...</div><div class="user-role" id="sidebar-role">...</div></div>
+    </div>
+    <div class="sidebar-points" id="sidebar-points">0 🌟</div>
+    <nav class="sidebar-nav">
+      <button class="nav-item active" data-page="dashboard" onclick="navigateTo('dashboard')"><span class="nav-icon">🏠</span> الرئيسية</button>
+      <button class="nav-item" data-page="attendance" onclick="navigateTo('attendance')"><span class="nav-icon">✅</span> الحضور</button>
+      <button class="nav-item" data-page="homework" onclick="navigateTo('homework')"><span class="nav-icon">📚</span> الواجبات</button>
+      <button class="nav-item" data-page="competitions" onclick="navigateTo('competitions')"><span class="nav-icon">🏆</span> المسابقات</button>
+      <button class="nav-item" data-page="teams" onclick="navigateTo('teams')"><span class="nav-icon">⚔️</span> الفرق</button>
+      <button class="nav-item" data-page="servant" id="servant-nav" onclick="navigateTo('servant')" style="display:none"><span class="nav-icon">👑</span> لوحة الخدام</button>
+    </nav>
+    <button class="logout-btn" onclick="doLogout()"><span>🚪</span> تسجيل الخروج</button>
+  </aside>
+  <main class="main-content">
+    <header class="mobile-header">
+      <button class="hamburger" onclick="toggleSidebar()">☰</button>
+      <span class="mobile-title">✝ شباب الكنيسة</span>
+      <span id="sidebar-points-mobile" style="color:var(--gold-light);font-weight:700;font-size:13px">0 🌟</span>
+    </header>
+    <div class="content-wrapper">
+      <div id="page-content"><div class="loader-wrap"><div class="loader"></div></div></div>
+    </div>
+  </main>
+</div>
+
+</body>
+</html>
